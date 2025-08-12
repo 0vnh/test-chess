@@ -1,4 +1,5 @@
 // Clean Chess implementation (click-to-move) with solid rules and UX
+import { initEngine, setElo, setBotConfig, requestMoveIfNeeded, resetEngineGame } from './engine/stockfish.js';
 // Board uses FEN-like chars: uppercase = White, lowercase = Black, '.' empty
 
 const START = [
@@ -43,13 +44,11 @@ const moveListEl = document.getElementById('moveList');
 const playerRowWhite = document.querySelector('.player-row.white');
 const playerRowBlack = document.querySelector('.player-row.black');
 // Bot controls
-const playBotToggle = document.getElementById('playBotToggle');
-const botColorSelect = document.getElementById('botColorSelect');
+const modeSelect = document.getElementById('modeSelect');
 const botLevelSelect = document.getElementById('botLevelSelect');
 
-// Engine (Stockfish) state
-let engine = null;
-let engineReady = false;
+// Engine (Stockfish) config/state (handled by engine module)
+let engineInited = false;
 let botEnabled = false;
 let botPlaysWhite = false; // default from UI
 let botElo = 1200;
@@ -115,16 +114,7 @@ function render(){
   drawArrows();
   renderMoveList();
   updateActivePlayerUI();
-  // If starting and bot plays white, let the engine move first
-  if(started && !gameOver){
-    triggerBotMoveIfNeeded();
-  }
-  if(!started && !gameOver){
-    started = true;
-    startTimer();
-    // In case bot is White and starts
-    triggerBotMoveIfNeeded();
-  }
+  // Do not start the timer automatically here; it will start after the first move
 }
 
 function updateStatus(){
@@ -431,8 +421,12 @@ function legalMovesFor(kind,r,c,white){
 }
 
 resetBtn.addEventListener('click', ()=>{
+  resetGame();
+});
+
+function resetGame(){
   board = START.map(row => row.split(''));
-  whiteToMove = true; selected=null; highlighted=[]; render();
+  whiteToMove = true; selected=null; highlighted=[];
   enPassant = null; gameOver = false;
   checkState = { whiteInCheck:false, blackInCheck:false };
   castle = { wK:true, wQ:true, bK:true, bQ:true };
@@ -441,11 +435,11 @@ resetBtn.addEventListener('click', ()=>{
   premove = null; arrows = []; drawArrows();
   lastMove = null; pendingJustMoved = null; moveHistory = []; plyCount = 0; renderMoveList();
   updateActivePlayerUI();
-  // New game for engine
-  if(engineReady){
-    engine.postMessage('ucinewgame');
-  }
-});
+  render();
+  // Engine new game and immediate move if bot to play
+  if(botEnabled){ ensureEngineInit(); resetEngineGame(); }
+  triggerBotMoveIfNeeded();
+}
 
 function updateActivePlayerUI(){
   try{
@@ -828,6 +822,12 @@ function postMoveUpdate(){
   whiteToMove = !whiteToMove;
   switchTimer();
   updateActivePlayerUI();
+  // Start clocks only after the very first move has been made
+  if(!started && !gameOver){
+    started = true;
+    startTimer();
+  }
+  // Now that turn switched, let bot move if it's their turn
   triggerBotMoveIfNeeded();
 
   // Update check state for side to move
@@ -950,4 +950,101 @@ if(boardEl && boardEl.parentElement){
     drawArrows();
   });
   window.addEventListener('resize', ()=>{ sizeCanvas(); drawArrows(); });
+}
+
+// --- Stockfish engine integration (appended) ---
+function ensureEngineInit(){
+  if(engineInited) return;
+  initEngine({
+    getFEN: toFEN,
+    onBestMove: applyEngineMove
+  });
+  setElo(botElo);
+  engineInited = true;
+}
+
+function coordFromAlg(sq){
+  const file = sq.charCodeAt(0) - 97; // a->0
+  const rank = sq.charCodeAt(1) - 48; // '1'->1
+  return [8 - rank, file];
+}
+
+function algFromCoord(r,c){
+  return String.fromCharCode(97 + c) + String(8 - r);
+}
+
+function toFEN(){
+  const rows=[];
+  for(let r=0;r<8;r++){
+    let row=''; let empty=0;
+    for(let c=0;c<8;c++){
+      const ch = board[r][c];
+      if(ch==='.') empty++; else { if(empty){ row+=empty; empty=0; } row+=ch; }
+    }
+    if(empty) row+=empty;
+    rows.push(row);
+  }
+  const placement = rows.join('/');
+  const side = whiteToMove? 'w':'b';
+  let rights='';
+  if(castle.wK) rights+='K'; if(castle.wQ) rights+='Q'; if(castle.bK) rights+='k'; if(castle.bQ) rights+='q';
+  if(!rights) rights='-';
+  const ep = enPassant ? algFromCoord(enPassant[0], enPassant[1]) : '-';
+  const half = 0; // not tracked
+  const full = 1 + Math.floor(plyCount/2);
+  return `${placement} ${side} ${rights} ${ep} ${half} ${full}`;
+}
+
+function triggerBotMoveIfNeeded(){
+  if(!botEnabled) return;
+  ensureEngineInit();
+  setBotConfig({ enabled: botEnabled, playsWhite: botPlaysWhite });
+  requestMoveIfNeeded(whiteToMove, gameOver, promotionPending);
+}
+
+function applyEngineMove(uci){
+  const from = uci.slice(0,2), to = uci.slice(2,4);
+  const promo = uci.length>4 ? uci[4] : null;
+  const [sr,sc] = coordFromAlg(from);
+  const [tr,tc] = coordFromAlg(to);
+  const moving = board[sr][sc];
+  if(!moving || moving==='.') return;
+  const isPromo = (moving==='P' && tr===0) || (moving==='p' && tr===7);
+  move(sr,sc,tr,tc);
+  if(isPromo && promo){
+    board[tr][tc] = (moving==='P') ? promo.toUpperCase() : promo.toLowerCase();
+  }
+  postMoveUpdate();
+}
+
+// Hook UI controls
+if(modeSelect){
+  const applyMode = ()=>{
+    const v = modeSelect.value;
+    if(v === 'pvp'){
+      botEnabled = false;
+      botPlaysWhite = false;
+    } else if(v === 'bot_black'){
+      botEnabled = true; // bot = black, human plays white
+      botPlaysWhite = false;
+    } else if(v === 'bot_white'){
+      botEnabled = true; // bot = white, human plays black
+      botPlaysWhite = true;
+    }
+    if(botEnabled){ ensureEngineInit(); }
+    setBotConfig({ enabled: botEnabled, playsWhite: botPlaysWhite });
+    // Reset and restart timer whenever mode changes
+    resetGame();
+  };
+  modeSelect.addEventListener('change', applyMode);
+  // Initialize mode on load
+  applyMode();
+}
+if(botLevelSelect){
+  botLevelSelect.addEventListener('change', ()=>{
+    botElo = parseInt(botLevelSelect.value,10) || 1200;
+    setElo(botElo);
+    // Do not reset game for strength changes; optional: uncomment to reset
+    // resetGame();
+  });
 }
